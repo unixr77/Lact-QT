@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""LACT için Qt6 (PySide6) arayüzü — aşama 2.
+"""LACT için Qt6 (PySide6) arayüzü — aşama 3.
 
-Sekmeler: Bilgi, İzleme, Güç, Hız aşırtma, Fan.
+Sekmeler: Bilgi, İzleme, Geçmiş, Güç, Durumlar, Hız aşırtma, Fan, Profiller, Süreçler, Sistem.
 Donanıma dokunan her şeyi lactd yapar; bu program yalnızca daemon'un JSON
 soketine bağlanan bir istemcidir. Yapılandırma okunur, değiştirilir ve
 bütünüyle geri yazılır, bu yüzden bilmediğimiz anahtarlar korunur.
@@ -21,11 +21,16 @@ from PySide6.QtWidgets import (
 )
 
 from curve import DEFAULT_CURVE, CurveModel
+from extra_pages import (
+    HistoryPage, ProcessesPage, ProfilesPage, StatesPage, SystemPage, VulkanDialog,
+)
 from lact_client import DEFAULT_SOCKET, LactClient, LactError, with_changes
+from logic import display_rows
+from ui_common import DASH, dig, gib, group, selectable
 
 LEVELS = ["auto", "low", "high", "manual"]
 POLL_MS = 1000
-DASH = "—"
+PROCESS_POLL_MS = 3000
 
 FAN_MODES = ["Otomatik (sürücü)", "Statik hız", "Özel eğri"]
 DEFAULT_FAN = {
@@ -43,41 +48,11 @@ PMFW_ROWS = [
 ]
 
 
-def dig(data, *keys, default=None):
-    """İç içe sözlükte güvenli erişim."""
-    for key in keys:
-        if isinstance(data, dict) and key in data:
-            data = data[key]
-        else:
-            return default
-    return default if data is None else data
-
-
-def gib(n):
-    return f"{n / 2**30:.1f} GiB" if isinstance(n, (int, float)) else DASH
-
-
 def fmt_state(value):
     """Güç durumu: {'Index': 1} -> '#1', None -> '—', metin -> olduğu gibi."""
     if isinstance(value, dict) and "Index" in value:
         return f"#{value['Index']}"
     return DASH if value is None else str(value)
-
-
-def selectable(text):
-    # Not: kaydırma alanındaki satır kaydıran QLabel'lar yüksekliği yanlış hesaplayıp
-    # metni kesiyor; bu yüzden satır kaydırma kapalı tutulur.
-    label = QLabel(str(text))
-    label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-    return label
-
-
-def group(title, rows):
-    box = QGroupBox(title)
-    form = QFormLayout(box)
-    for name, value in rows:
-        form.addRow(f"{name}:", selectable(value))
-    return box
 
 
 def rdna_table(clocks):
@@ -128,12 +103,13 @@ class OptionalValue(QWidget):
 
 # --------------------------------------------------------------------------- #
 class InfoPage(QScrollArea):
-    def __init__(self):
+    def __init__(self, on_vulkan=None):
         super().__init__()
+        self._on_vulkan = on_vulkan
         self.setWidgetResizable(True)
         self.setFrameShape(QScrollArea.Shape.NoFrame)
 
-    def show_info(self, info, system):
+    def show_info(self, info, system, displays=None):
         drm = dig(info, "drm_info", default={})
         pci = dig(info, "pci_info", default={})
         link = dig(info, "link_info", default={})
@@ -172,6 +148,13 @@ class InfoPage(QScrollArea):
                 ("API sürümü", vk.get("api_version", DASH)),
                 ("Sürücü", "{} — {}".format(drv.get("name", DASH), drv.get("info", DASH))),
             ]))
+            if self._on_vulkan:
+                btn = QPushButton("Vulkan ayrıntıları…")
+                btn.clicked.connect(self._on_vulkan)
+                row = QHBoxLayout()
+                row.addStretch(1)
+                row.addWidget(btn)
+                lay.addLayout(row)
         if cl:
             lay.addWidget(group("OpenCL", [
                 ("Platform", cl.get("platform_name", DASH)),
@@ -179,6 +162,9 @@ class InfoPage(QScrollArea):
                 ("Genel bellek", gib(cl.get("global_memory"))),
             ]))
         od = system.get("amdgpu_overdrive_enabled")
+        shown = display_rows(displays)
+        if shown:
+            lay.addWidget(group("Ekranlar", shown))
         lay.addWidget(group("Yazılım", [
             ("LACT", "{} ({})".format(system.get("version", DASH), system.get("commit", DASH))),
             ("Dağıtım", system.get("distro", DASH)),
@@ -626,14 +612,17 @@ class FanPage(QScrollArea):
         self.live = QLabel(DASH)
         mode_form.addRow("Mod:", self.mode)
         mode_form.addRow("Şu an:", self.live)
+        self.fan_warn = QLabel("")
+        mode_form.addRow("", self.fan_warn)
         outer.addWidget(mode_box)
 
         self.curve_box = QGroupBox("Özel eğri")
         curve_lay = QVBoxLayout(self.curve_box)
         self.curve = CurveEditor()
         curve_lay.addWidget(self.curve)
-        curve_lay.addWidget(QLabel(
-            "Sürükle: taşı  •  boş yere çift tıkla: nokta ekle  •  sağ tık ya da Delete: sil"))
+        self.curve_hint = QLabel(
+            "Sürükle: taşı  •  boş yere çift tıkla: nokta ekle  •  sağ tık ya da Delete: sil")
+        curve_lay.addWidget(self.curve_hint)
         form = QFormLayout()
         self.temp_key = QComboBox()
         self.interval = QSpinBox()
@@ -697,7 +686,8 @@ class FanPage(QScrollArea):
         self.static_box.setEnabled(index == 1)
         self.curve_box.setEnabled(index == 2)
 
-    def load(self, stats, config):
+    def load(self, stats, config, flags=None):
+        flags = list(flags or [])
         fan = dig(stats, "fan", default={})
         enabled = bool(config.get("fan_control_enabled"))
         saved = copy.deepcopy(config.get("fan_control_settings") or {})
@@ -710,6 +700,16 @@ class FanPage(QScrollArea):
         s_max = min(1.0, round(pwm_max / 255, 2)) if pwm_max else 1.0
         t_lo, t_hi = fan.get("temperature_range") or (25, 100)
 
+        # RDNA3+ kartlarda (HasPmfw) LACT eğrinin tam 5 noktalı olmasını ister.
+        fixed = "HasPmfw" in flags
+        self.curve.model.fixed_count = 5 if fixed else None
+        self.curve_hint.setText(
+            "Sürükle: noktaları taşı  •  bu kartta eğri tam 5 noktalı olmalı (nokta eklenemez/silinemez)"
+            if fixed else
+            "Sürükle: taşı  •  boş yere çift tıkla: nokta ekle  •  sağ tık ya da Delete: sil")
+        self.fan_warn.setText(
+            "" if (not flags or "ConfigurableFanControl" in flags) else
+            "Uyarı: bu kartta özel fan kontrolü yapılandırılamıyor görünüyor (Overdrive kapalı olabilir).")
         self.curve.model.set_limits(t_lo, t_hi, s_min, s_max)
         self.curve.model.load(self._settings.get("curve"))
         self.curve.reload()
@@ -834,11 +834,14 @@ class MainWindow(QMainWindow):
         self.info = {}
         self.stats = {}
         self.clocks = {}
+        self.displays = {}
+        self.states = {}
+        self.modes = {}
         self.config = {}
 
         self.setWindowTitle("LACT")
         self.setWindowIcon(QIcon.fromTheme("preferences-desktop-display"))
-        self.resize(760, 760)
+        self.resize(900, 780)
 
         central = QWidget()
         lay = QVBoxLayout(central)
@@ -847,24 +850,35 @@ class MainWindow(QMainWindow):
         self.gpu_box = QComboBox()
         self.gpu_box.currentIndexChanged.connect(self._gpu_selected)
         top.addWidget(self.gpu_box, 1)
+        self.profile_label = QLabel("Profil: " + DASH)
+        top.addWidget(self.profile_label)
         lay.addLayout(top)
 
-        self.info_page = InfoPage()
+        self.info_page = InfoPage(self.show_vulkan)
         self.stats_page = StatsPage()
+        self.history_page = HistoryPage()
         self.perf_page = PerfPage(self.apply_config, self.reload_config)
+        self.states_page = StatesPage(self.apply_config, self.reload_config)
         self.oc_page = OcPage(self.apply_config, self.reload_config)
         self.fan_page = FanPage(self.apply_config, self.reload_config)
+        self.profiles_page = ProfilesPage(client, self.on_profile_changed)
+        self.proc_page = ProcessesPage()
+        self.system_page = SystemPage(client, lambda: self.gid, self.on_system_changed)
         self.tabs = QTabWidget()
-        self.tabs.addTab(self.info_page, "Bilgi")
-        self.tabs.addTab(self.stats_page, "İzleme")
-        self.tabs.addTab(self.perf_page, "Güç")
-        self.tabs.addTab(self.oc_page, "Hız aşırtma")
-        self.tabs.addTab(self.fan_page, "Fan")
+        for page, title in ((self.info_page, "Bilgi"), (self.stats_page, "İzleme"),
+                            (self.history_page, "Geçmiş"), (self.perf_page, "Güç"),
+                            (self.states_page, "Durumlar"), (self.oc_page, "Hız aşırtma"),
+                            (self.fan_page, "Fan"), (self.profiles_page, "Profiller"),
+                            (self.proc_page, "Süreçler"), (self.system_page, "Sistem")):
+            self.tabs.addTab(page, title)
+        self.tabs.currentChanged.connect(self._tab_changed)
         lay.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
 
         self.poll = QTimer(self)
         self.poll.timeout.connect(self.refresh_stats)
+        self.proc_timer = QTimer(self)
+        self.proc_timer.timeout.connect(self.refresh_processes)
 
     # -- bağlantı ve yükleme --
     def connect_daemon(self):
@@ -884,27 +898,38 @@ class MainWindow(QMainWindow):
         if self.devices:
             self.load_gpu(0)
         else:
+            self.gid = None
             self.statusBar().showMessage("lactd hiç GPU bulamadı.")
+        self.profiles_page.reload()
 
     def _gpu_selected(self, index):
         if 0 <= index < len(self.devices):
             self.load_gpu(index)
 
+    def _optional(self, fn):
+        """Kartın desteklemeyebileceği okumalar: hata olursa boş döner."""
+        try:
+            return fn(self.gid)
+        except LactError:
+            return {}
+
     def _fetch(self):
-        """Config, istatistik ve saat tablosunu okur; saat tablosu isteğe bağlıdır."""
+        """Config ve istatistik zorunlu; geri kalanlar isteğe bağlıdır."""
         self.config = self.client.get_config(self.gid)
         self.stats = self.client.device_stats(self.gid)
-        try:
-            self.clocks = self.client.clocks_info(self.gid)
-        except LactError:
-            self.clocks = {}
+        self.clocks = self._optional(self.client.clocks_info)
+        self.states = self._optional(self.client.power_states)
+        self.modes = self._optional(self.client.power_profile_modes)
 
     def _fill_pages(self):
+        flags = self.info.get("flags") or []
         ratio = dig(self.info, "drm_info", "vram_clock_ratio", default=1.0)
         self.perf_page.load(self.stats, self.config)
+        self.states_page.load(self.states, self.modes, self.config)
         self.oc_page.load(self.config, self.clocks, ratio,
                           self.system.get("amdgpu_overdrive_enabled"))
-        self.fan_page.load(self.stats, self.config)
+        self.fan_page.load(self.stats, self.config, flags)
+        self.system_page.set_system(self.system, flags)
 
     def load_gpu(self, index):
         self.gid = self.devices[index]["id"]
@@ -914,7 +939,8 @@ class MainWindow(QMainWindow):
         except LactError as exc:
             self.statusBar().showMessage(f"GPU verisi alınamadı: {exc}")
             return
-        self.info_page.show_info(self.info, self.system)
+        self.displays = self._optional(self.client.displays_info)
+        self.info_page.show_info(self.info, self.system, self.displays)
         self.stats_page.update_stats(self.stats)
         self._fill_pages()
         self.statusBar().showMessage("Bağlandı.")
@@ -930,6 +956,7 @@ class MainWindow(QMainWindow):
             return
         self.stats_page.update_stats(stats)
         self.fan_page.update_live(stats)
+        self.history_page.add_stats(stats)
 
     def reload_config(self):
         if not self.gid:
@@ -940,6 +967,44 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Yapılandırma okunamadı: {exc}")
             return
         self._fill_pages()
+
+    # -- sekmeler --
+    def _tab_changed(self, index):
+        page = self.tabs.widget(index)
+        if page is self.proc_page:
+            self.refresh_processes()
+            self.proc_timer.start(PROCESS_POLL_MS)
+        else:
+            self.proc_timer.stop()
+        if page is self.profiles_page:
+            self.profiles_page.reload()
+
+    def refresh_processes(self):
+        if not self.gid:
+            return
+        try:
+            self.proc_page.load(self.client.process_list(self.gid))
+        except LactError as exc:
+            self.statusBar().showMessage(f"Süreç listesi alınamadı: {exc}")
+
+    def show_vulkan(self):
+        if not self.gid:
+            return
+        try:
+            api = self.client.api_info(self.gid)
+        except LactError as exc:
+            QMessageBox.warning(self, "Vulkan ayrıntıları", str(exc))
+            return
+        VulkanDialog(self, api).exec()
+
+    def on_profile_changed(self, current, config_changed):
+        self.profile_label.setText(f"Profil: {current or 'Varsayılan'}")
+        if config_changed:
+            self.reload_config()
+
+    def on_system_changed(self):
+        """Overdrive, GPU ayırma ya da sıfırlama sonrası her şeyi baştan okur."""
+        self.connect_daemon()
 
     # -- ayar uygulama --
     def apply_config(self, changes):

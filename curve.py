@@ -7,6 +7,8 @@ class CurveModel:
     """Sıcaklık (°C, tam sayı) -> fan hızı (0..1) noktaları; sıcaklığa göre sıralı."""
 
     def __init__(self, t_min=25, t_max=100, s_min=0.30, s_max=1.0):
+        # fixed_count: RDNA3+ kartlarda LACT eğrinin tam 5 noktalı olmasını ister.
+        self.fixed_count = None
         self.set_limits(t_min, t_max, s_min, s_max)
         self.points = []
         self.load(DEFAULT_CURVE)
@@ -34,6 +36,17 @@ class CurveModel:
         if len(pts) < 2:
             pts = {self._clamp_t(float(k)): self._clamp_s(v) for k, v in DEFAULT_CURVE.items()}
         self.points = [[t, s] for t, s in sorted(pts.items())]
+        if self.fixed_count and len(self.points) != self.fixed_count:
+            self._resample(self.fixed_count)
+
+    def _resample(self, n):
+        """Eğriyi, aynı sıcaklık aralığında n eşit aralıklı noktaya yeniden örnekler."""
+        t0, t1 = self.points[0][0], self.points[-1][0]
+        if t1 - t0 < n - 1:  # tamsayı sıcaklıklarla n ayrı nokta sığmıyor
+            t0, t1 = self.t_min, self.t_max
+        temps = [int(round(t0 + (t1 - t0) * i / (n - 1))) for i in range(n)]
+        speeds = [self.speed_at(t) for t in temps]
+        self.points = [[t, self._clamp_s(s)] for t, s in zip(temps, speeds)]
 
     def to_config(self):
         return {str(t): s for t, s in self.points}
@@ -45,7 +58,9 @@ class CurveModel:
         self.points[index] = [min(max(int(round(temp)), lo), max(hi, lo)), self._clamp_s(speed)]
 
     def add(self, temp, speed):
-        """Yeni nokta ekler; o sıcaklıkta nokta varsa None döndürür."""
+        """Yeni nokta ekler; o sıcaklıkta nokta varsa ya da sayı sabitse None döndürür."""
+        if self.fixed_count:
+            return None
         temp = self._clamp_t(temp)
         if any(t == temp for t, _ in self.points):
             return None
@@ -54,8 +69,8 @@ class CurveModel:
         return next(i for i, p in enumerate(self.points) if p[0] == temp)
 
     def remove(self, index):
-        """En az iki nokta kalmalıdır."""
-        if len(self.points) <= 2:
+        """En az iki nokta kalmalıdır; nokta sayısı sabitse silinemez."""
+        if self.fixed_count or len(self.points) <= 2:
             return False
         del self.points[index]
         return True
