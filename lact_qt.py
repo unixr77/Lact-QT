@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LACT için Qt6 (PySide6) arayüzü.
+"""LACT QT: LACT için Qt6 (PySide6) arayüzü.
 
 Sekmeler: Bilgi, İzleme (canlı + geçmiş), Güç, Fan, Profiller, Süreçler; sistem işlemleri ☰ menüsünde.
 Donanıma dokunan her şeyi lactd yapar; bu program yalnızca daemon'un JSON
@@ -12,7 +12,7 @@ import math
 import sys
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPen
+from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QProgressBar,
@@ -26,7 +26,7 @@ from extra_pages import (
     ask_service_action,
 )
 from lact_client import DEFAULT_SOCKET, LactClient, LactError, is_tcp_address, with_changes
-from logic import VERSION, display_rows
+from logic import VERSION, display_rows, temp_label
 from prefs import Prefs
 from service import ServiceController, wait_for_socket
 from ui_common import DASH, confirm, dig, gib, group, waiting
@@ -249,7 +249,7 @@ class StatsPage(QWidget):
             label = self.temp_rows.get(name)
             if label is None:
                 label = QLabel()
-                self.temp_form.addRow(f"{name}:", label)
+                self.temp_form.addRow(f"{temp_label(name)}:", label)
                 self.temp_rows[name] = label
             cur, crit = t.get("current"), t.get("crit")
             text = f"{cur:.0f} °C" if isinstance(cur, (int, float)) else DASH
@@ -671,6 +671,7 @@ class FanPage(QScrollArea):
         self.fan_warn.setText(
             "" if (not flags or "ConfigurableFanControl" in flags) else
             "Uyarı: bu kartta özel fan kontrolü yapılandırılamıyor görünüyor (Overdrive kapalı olabilir).")
+        self.fan_warn.setVisible(bool(self.fan_warn.text()))
         self.curve.model.set_limits(t_lo, t_hi, s_min, s_max)
         self.curve.model.load(self._settings.get("curve"))
         self.curve.reload()
@@ -762,7 +763,8 @@ class ConfirmDialog(QDialog):
         self.label = QLabel()
         lay.addWidget(self.label)
         buttons = QDialogButtonBox()
-        buttons.addButton("Değişiklikleri koru", QDialogButtonBox.ButtonRole.AcceptRole)
+        keep_btn = buttons.addButton("Değişiklikleri koru", QDialogButtonBox.ButtonRole.AcceptRole)
+        keep_btn.setDefault(True)  # Enter ile onaylanır
         buttons.addButton("Geri al", QDialogButtonBox.ButtonRole.RejectRole)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -890,17 +892,16 @@ class MainWindow(QMainWindow):
         self.modes = {}
         self.config = {}
 
-        self.setWindowTitle("LACT")
+        self.setWindowTitle("LACT QT")
+        self.setMinimumSize(640, 520)
         self.setWindowIcon(QIcon.fromTheme("lact-qt", QIcon.fromTheme("preferences-desktop-display")))
         self.resize(int(self.prefs.get("width", 860)), int(self.prefs.get("height", 760)))
 
         central = QWidget()
         lay = QVBoxLayout(central)
         top = QHBoxLayout()
-        self.gpu_label = QLabel("Ekran kartı:")
         self.gpu_box = QComboBox()
         self.gpu_box.currentIndexChanged.connect(self._gpu_selected)
-        top.addWidget(self.gpu_label)
         top.addWidget(self.gpu_box, 1)
         top.addStretch(1)
         self.profile_label = QLabel("Profil: " + DASH)
@@ -937,6 +938,9 @@ class MainWindow(QMainWindow):
         self.poll.timeout.connect(self.refresh_stats)
         self.proc_timer = QTimer(self)
         self.proc_timer.timeout.connect(self.refresh_processes)
+        self.retry_timer = QTimer(self)  # tek atımlık; art arda çağrılar birikmez
+        self.retry_timer.setSingleShot(True)
+        self.retry_timer.timeout.connect(self.connect_daemon)
 
     # -- menü --
     def _build_menu(self):
@@ -961,6 +965,9 @@ class MainWindow(QMainWindow):
         self.act_reset = add("Tüm ayarları sıfırla", self.sysactions.reset)
         menu.addSeparator()
         self.act_about = add("Hakkında", self.show_about)
+        self.act_quit = add("Çıkış", self.close)
+        self.act_quit.setShortcut(QKeySequence("Ctrl+Q"))
+        self.addAction(self.act_quit)  # menü kapalıyken de çalışsın
 
     def _update_menu(self):
         flags = self.info.get("flags") or []
@@ -969,7 +976,7 @@ class MainWindow(QMainWindow):
         self.act_od.setEnabled(od is not None)
         self.act_vbios.setEnabled("DumpableVBios" in flags)
         self.act_local.setVisible(self.client.is_remote)
-        self.setWindowTitle(f"LACT — {self.client.path}" if self.client.is_remote else "LACT")
+        self.setWindowTitle(f"LACT QT — {self.client.path}" if self.client.is_remote else "LACT QT")
 
     # -- bağlantı ve yükleme --
     def connect_daemon(self):
@@ -981,19 +988,20 @@ class MainWindow(QMainWindow):
             if not self.client.is_remote and reason in ("missing", "refused") \
                     and not self._service_prompted:
                 self._offer_service()
-                QTimer.singleShot(300, self.connect_daemon)
+                self.retry_timer.start(300)
                 return
             if reason == "denied" and not self._denied_shown:
                 self._denied_shown = True
                 QMessageBox.warning(
                     self, "Soket erişimi reddedildi",
-                    "lactd soketine erişim izni yok.\\nKullanıcın lactd'nin yetkili grubunda "
+                    "lactd soketine erişim izni yok.\nKullanıcın lactd'nin yetkili grubunda "
                     "(varsayılan: wheel) olmalı ya da /etc/lact/config.yaml içinde admin_user "
                     "ayarlanmalı; ardından servisi yeniden başlat.")
             self.statusBar().showMessage(
                 f"lactd'ye bağlanılamadı ({exc}). 3 sn sonra yeniden denenecek…")
-            QTimer.singleShot(3000, self.connect_daemon)
+            self.retry_timer.start(3000)
             return
+        self.retry_timer.stop()
         previous = self.gid
         self.gpu_box.blockSignals(True)
         self.gpu_box.clear()
@@ -1104,7 +1112,7 @@ class MainWindow(QMainWindow):
         state = self.service.state()
         if not state["installed"]:
             QMessageBox.warning(self, "LACT servisi bulunamadı",
-                                "lactd.service sistemde kurulu değil.\\n"
+                                "lactd.service sistemde kurulu değil.\n"
                                 "lact-qt paketini kurduğundan emin ol.")
             return False
         if state["active"]:
@@ -1179,8 +1187,8 @@ class MainWindow(QMainWindow):
 
     def show_about(self):
         QMessageBox.about(
-            self, "LACT hakkında",
-            f"LACT Qt arayüzü {VERSION}\\nDaemon: LACT {self.system.get('version', DASH)}\\n"
+            self, "LACT QT hakkında",
+            f"LACT QT {VERSION}\nDaemon: LACT {self.system.get('version', DASH)}\n"
             f"Bağlantı: {self.client.path}")
 
     def _profile_context(self):
@@ -1240,7 +1248,7 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LACT için Qt arayüzü")
+    parser = argparse.ArgumentParser(description="LACT QT — LACT için Qt arayüzü")
     parser.add_argument("--socket", default=DEFAULT_SOCKET, help="lactd unix soket yolu")
     parser.add_argument("--tcp-address", metavar="HOST:PORT",
                         help="uzak lactd'ye TCP ile bağlan")

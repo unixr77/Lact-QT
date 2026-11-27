@@ -27,4 +27,4 @@ else
     *) echo "Atlandı. lact-qt'yi açınca servisi başlatma diyaloğu çıkar." ;;
   esac
 fi
-echo "Tamam. Uygulama menüsünde 'LACT' girişini ya da 'lact-qt' komutunu kullan."
+echo "Tamam. Uygulama menüsünde 'LACT QT' girişini ya da 'lact-qt' komutunu kullan."

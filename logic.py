@@ -10,6 +10,14 @@ from datetime import datetime
 
 VERSION = "1.0.0"
 
+TEMP_NAMES = {"edge": "Kenar", "junction": "Junction", "mem": "Bellek",
+              "vrgfx": "VRM GFX", "vrmem": "VRM bellek", "vrsoc": "VRM SoC"}
+
+
+def temp_label(key):
+    """Sensör anahtarının okunabilir adı (bilinmiyorsa anahtarın kendisi)."""
+    return TEMP_NAMES.get(key, key)
+
 # ---------------------------------------------------------------- geçmiş --- #
 
 

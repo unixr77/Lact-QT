@@ -1,12 +1,12 @@
 # Maintainer: lact-qt kullanıcısı
-# LACT'ın GTK4/libadwaita arayüzü yerine Qt6 (PySide6) arayüzü kurar. Donanıma dokunan
+# LACT QT: LACT'ın GTK4/libadwaita arayüzü yerine Qt6 (PySide6) arayüzü kurar. Donanıma dokunan
 # 'lact' daemon'u (lactd) kaynak koddan, GUI'siz (headless) olarak derlenir; böylece
 # resmi 'lact' paketi gerekmez.
 pkgname=lact-qt
 pkgver=1.0.0
 pkgrel=1
 _lactver=0.10.1
-pkgdesc="LACT için Qt6/KDE arayüzü ve GUI'siz LACT daemon'u (GTK/libadwaita gerekmez)"
+pkgdesc="LACT QT: LACT için Qt6/KDE arayüzü ve GUI'siz LACT daemon'u (GTK/libadwaita gerekmez)"
 arch=('x86_64')
 url="https://github.com/ilya-zlobintsev/LACT"
 license=('MIT')

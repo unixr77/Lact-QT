@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=LACT
-Name[tr]=LACT
+Name=LACT QT
+Name[tr]=LACT QT
 GenericName=GPU Control
 GenericName[tr]=Ekran Kartı Denetimi
 Comment=Monitor and tune your graphics card

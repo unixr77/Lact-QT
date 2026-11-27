@@ -20,7 +20,7 @@ from logic import (
     POWER_KINDS, RULE_TEMPLATES, HistoryStore, fmt_age, fmt_mem,
     heuristics_from_cells, history_to_csv, nice_range, parse_modes, parse_profiles,
     parse_rule_text, parse_states, process_rows, rule_summary,
-    sample_from_stats, states_to_config, vbios_to_bytes,
+    sample_from_stats, states_to_config, temp_label, vbios_to_bytes,
 )
 from ui_common import DASH, confirm, waiting
 
@@ -89,8 +89,9 @@ class LinePlot(QWidget):
         p.drawText(QPointF(r.right() - 34, r.bottom() + 16), "şimdi")
 
         title = f"{self.title} ({self.unit})" if self.unit else self.title
-        p.drawText(QPointF(6, 14), title)
-        x_legend = 6 + p.fontMetrics().horizontalAdvance(title) + 24
+        # Başlık ve gösterge, grafiğin sol kenarıyla hizalı başlar (y ekseni etiketleri solda kalır)
+        p.drawText(QPointF(r.left(), 14), title)
+        x_legend = r.left() + p.fontMetrics().horizontalAdvance(title) + 24
         if not any(pts for _n, pts in self.series):
             p.drawText(QPointF(r.center().x() - 40, r.center().y()), "veri bekleniyor")
             return
@@ -181,7 +182,8 @@ class HistoryPage(QWidget):
         window = self.current_window()
         now = time.time()
         get = lambda key: self.store.series(key, window, now)
-        temps = [(k.split(":", 1)[1], get(k)) for k in self.store.keys() if k.startswith("temp:")]
+        temps = [(temp_label(k.split(":", 1)[1]), get(k))
+                 for k in self.store.keys() if k.startswith("temp:")]
         self.plots["temp"].set_data(temps, window)
         self.plots["clock"].set_data([("GPU", get("clock:gpu")), ("VRAM", get("clock:vram"))], window)
         self.plots["power"].set_data([("Güç", get("power"))], window)

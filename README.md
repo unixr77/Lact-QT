@@ -1,6 +1,6 @@
-# lact-qt
+# LACT QT
 
-LACT'ın GTK4/libadwaita arayüzü yerine Qt6 (PySide6) arayüzü. Donanıma dokunan `lactd`
+LACT QT: LACT'ın GTK4/libadwaita arayüzü yerine Qt6 (PySide6) arayüzü. Donanıma dokunan `lactd`
 daemon'u, LACT'ın kaynak kodundan GUI'siz derlenip pakete eklenir; resmi `lact` paketi gerekmez.
 
 ## Kurulum (Arch / CachyOS)
