@@ -3,19 +3,22 @@ import copy
 import json
 import time
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtGui import QColor, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog,
     QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QListWidget, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+    QListWidget, QMessageBox, QPlainTextEdit, QPushButton,
     QSizePolicy, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from lact_client import LactError
+from profile_io import (
+    build_export, config_to_changes, dumps, extract_profile, parse_export, pick_config, unique_name,
+)
 from logic import (
     POWER_KINDS, RULE_TEMPLATES, HistoryStore, fmt_age, fmt_mem,
-    heuristics_from_cells, nice_range, parse_modes, parse_profiles,
+    heuristics_from_cells, history_to_csv, nice_range, parse_modes, parse_profiles,
     parse_rule_text, parse_states, process_rows, rule_summary,
     sample_from_stats, states_to_config, vbios_to_bytes,
 )
@@ -43,12 +46,12 @@ class LinePlot(QWidget):
         self.title, self.unit = title, unit
         self.y_min, self.y_max = y_min, y_max
         self.series = []  # [(ad, [(yaş_sn, değer)])]
-        self.window = 60.0
+        self.span = 60.0
         self.setMinimumHeight(130)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def set_data(self, series, window):
-        self.series, self.window = series, float(window)
+        self.series, self.span = series, float(window)
         self.update()
 
     def _bounds(self):
@@ -81,8 +84,8 @@ class LinePlot(QWidget):
             p.setPen(QPen(text, 1))
             p.drawText(QPointF(6, y + 4), f"{value:g}")
         p.setPen(QPen(text, 1))
-        p.drawText(QPointF(r.left(), r.bottom() + 16), f"-{fmt_age(self.window)}")
-        p.drawText(QPointF(r.center().x() - 14, r.bottom() + 16), f"-{fmt_age(self.window / 2)}")
+        p.drawText(QPointF(r.left(), r.bottom() + 16), f"-{fmt_age(self.span)}")
+        p.drawText(QPointF(r.center().x() - 14, r.bottom() + 16), f"-{fmt_age(self.span / 2)}")
         p.drawText(QPointF(r.right() - 34, r.bottom() + 16), "şimdi")
 
         title = f"{self.title} ({self.unit})" if self.unit else self.title
@@ -93,7 +96,7 @@ class LinePlot(QWidget):
             return
         for i, (name, pts) in enumerate(self.series):
             color = QColor(PALETTE[i % len(PALETTE)])
-            pixels = [QPointF(r.left() + (age + self.window) / self.window * r.width(),
+            pixels = [QPointF(r.left() + (age + self.span) / self.span * r.width(),
                               r.bottom() - (value - lo) / (hi - lo) * r.height())
                       for age, value in pts]
             p.setPen(QPen(color, 2))
@@ -111,60 +114,100 @@ class LinePlot(QWidget):
 class HistoryPage(QWidget):
     WINDOWS = [("1 dakika", 60), ("5 dakika", 300), ("15 dakika", 900),
                ("30 dakika", 1800), ("60 dakika", 3600)]
+    # (anahtar, başlık, birim, y_min, y_max)
+    PLOTS = [("temp", "Sıcaklık", "°C", None, None), ("clock", "Saat", "MHz", 0, None),
+             ("power", "Güç", "W", 0, None), ("usage", "Kullanım", "%", 0, 100),
+             ("fan", "Fan", "RPM", 0, None)]
+    DEFAULT_VISIBLE = ["temp", "clock", "power", "usage"]
 
-    def __init__(self):
+    def __init__(self, prefs=None):
         super().__init__()
+        self.prefs = prefs
         self.store = HistoryStore(3600)
         outer = QVBoxLayout(self)
         top = QHBoxLayout()
-        top.addWidget(QLabel("Süre:"))
         self.window_box = QComboBox()
         self.window_box.addItems([name for name, _s in self.WINDOWS])
-        self.window_box.currentIndexChanged.connect(lambda _i: self.refresh())
+        saved = prefs.get("history_window", 0) if prefs else 0
+        self.window_box.setCurrentIndex(saved if isinstance(saved, int)
+                                        and 0 <= saved < len(self.WINDOWS) else 0)
+        self.window_box.currentIndexChanged.connect(self._window_changed)
         top.addWidget(self.window_box)
+        visible = prefs.get("history_plots", self.DEFAULT_VISIBLE) if prefs else self.DEFAULT_VISIBLE
+        self.checks, self.plots = {}, {}
+        for key, title, _unit, _lo, _hi in self.PLOTS:
+            check = QCheckBox(title)
+            check.setChecked(key in visible)
+            check.toggled.connect(self._plots_changed)
+            self.checks[key] = check
+            top.addWidget(check)
         top.addStretch(1)
-        self.clear_btn = QPushButton("Temizle")
-        self.clear_btn.clicked.connect(self.clear)
-        top.addWidget(self.clear_btn)
+        self.export_btn = QPushButton("CSV…")
+        self.export_btn.clicked.connect(self.export_csv)
+        top.addWidget(self.export_btn)
         outer.addLayout(top)
+        for key, title, unit, lo, hi in self.PLOTS:
+            self.plots[key] = LinePlot(title, unit, y_min=lo, y_max=hi)
+            outer.addWidget(self.plots[key], 1)
+        self._apply_visibility()
 
-        self.temp_plot = LinePlot("Sıcaklık", "°C")
-        self.clock_plot = LinePlot("Saat", "MHz", y_min=0)
-        self.power_plot = LinePlot("Güç", "W", y_min=0)
-        self.usage_plot = LinePlot("Kullanım", "%", y_min=0, y_max=100)
-        self.fan_plot = LinePlot("Fan", "RPM", y_min=0)
-        for plot in (self.temp_plot, self.clock_plot, self.power_plot,
-                     self.usage_plot, self.fan_plot):
-            outer.addWidget(plot, 1)
+    def current_window(self):
+        return self.WINDOWS[max(0, self.window_box.currentIndex())][1]
+
+    def _window_changed(self, index):
+        if self.prefs:
+            self.prefs.set("history_window", index)
+        self.refresh()
+
+    def _plots_changed(self, _checked=False):
+        if self.prefs:
+            self.prefs.set("history_plots", [k for k, c in self.checks.items() if c.isChecked()])
+        self._apply_visibility()
+
+    def _apply_visibility(self):
+        for key, plot in self.plots.items():
+            plot.setVisible(self.checks[key].isChecked())
+
+    def clear(self):
+        self.store.clear()
+        self.refresh()
 
     def add_stats(self, stats):
         self.store.add(sample_from_stats(stats))
         if self.isVisible():
             self.refresh()
 
-    def clear(self):
-        self.store.clear()
-        self.refresh()
-
     def refresh(self):
-        window = self.WINDOWS[max(0, self.window_box.currentIndex())][1]
+        window = self.current_window()
         now = time.time()
         get = lambda key: self.store.series(key, window, now)
         temps = [(k.split(":", 1)[1], get(k)) for k in self.store.keys() if k.startswith("temp:")]
-        self.temp_plot.set_data(temps, window)
-        self.clock_plot.set_data([("GPU", get("clock:gpu")), ("VRAM", get("clock:vram"))], window)
-        self.power_plot.set_data([("Güç", get("power"))], window)
-        self.usage_plot.set_data([("GPU", get("busy")), ("VRAM", get("vram_pct"))], window)
-        self.fan_plot.set_data([("Fan", get("fan_rpm"))], window)
+        self.plots["temp"].set_data(temps, window)
+        self.plots["clock"].set_data([("GPU", get("clock:gpu")), ("VRAM", get("clock:vram"))], window)
+        self.plots["power"].set_data([("Güç", get("power"))], window)
+        self.plots["usage"].set_data([("GPU", get("busy")), ("VRAM", get("vram_pct"))], window)
+        self.plots["fan"].set_data([("Fan", get("fan_rpm"))], window)
+
+    def export_csv(self):
+        if not self.store.samples:
+            QMessageBox.information(self, "CSV", "Henüz kaydedilmiş veri yok.")
+            return
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Geçmişi CSV olarak kaydet", "lact-gecmis.csv", "CSV (*.csv)")
+        if not path:
+            return
+        text = history_to_csv(self.store)  # tüm geçmiş, yalnızca görünen pencere değil
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        QMessageBox.information(self, "CSV", f"{len(self.store.samples)} satır kaydedildi:\n{path}")
 
 
 # --------------------------------------------------------------------------- #
-class StatesPage(QScrollArea):
+class StatesPage(QWidget):
     """AMD güç durumları (açık/kapalı) ve güç profili modu."""
 
-    def __init__(self, on_apply, on_reload):
+    def __init__(self):
         super().__init__()
-        self._on_apply = on_apply
         self._config = {}
         self._states = {"core": [], "vram": []}
         self._checks = {"core": [], "vram": []}
@@ -173,11 +216,7 @@ class StatesPage(QScrollArea):
         self._mode_names = []
         self._cells = []
         self._cell_widgets = []
-        self.setWidgetResizable(True)
-        self.setFrameShape(QScrollArea.Shape.NoFrame)
-
-        body = QWidget()
-        outer = QVBoxLayout(body)
+        outer = QVBoxLayout(self)
         self.note = QLabel()
         outer.addWidget(self.note)
         self.boxes, self.box_layouts = {}, {}
@@ -202,13 +241,6 @@ class StatesPage(QScrollArea):
         self.mode_check.toggled.connect(self._sync_mode)
         self.mode_combo.currentIndexChanged.connect(self._sync_mode)
 
-        self.reload_btn = QPushButton("Geri yükle")
-        self.apply_btn = QPushButton("Uygula")
-        self.reload_btn.clicked.connect(on_reload)
-        self.apply_btn.clicked.connect(self._apply)
-        outer.addLayout(button_row(self.reload_btn, self.apply_btn))
-        outer.addStretch(1)
-        self.setWidget(body)
 
     def _sync_mode(self, *_args):
         on = self.mode_check.isChecked()
@@ -251,8 +283,7 @@ class StatesPage(QScrollArea):
         self._build_custom(modes, value_names, config)
         level = config.get("performance_level") or "auto"
         self.note.setText(
-            "Not: güç profili modu 'manual' performans seviyesi gerektirir (Güç sekmesi);\n"
-            f"bazı kartlarda güç durumları için de gerekebilir. Şu anki seviye: {level}")
+            f"Güç profili modu 'manual' performans seviyesi gerektirir (şu an: {level}).")
         self._sync_mode()
 
     def _build_custom(self, modes, value_names, config):
@@ -302,14 +333,6 @@ class StatesPage(QScrollArea):
             changes["power_profile_mode_index"] = None
         return changes
 
-    def _apply(self):
-        try:
-            changes = self.collect()
-        except ValueError as exc:
-            QMessageBox.warning(self, "Geçersiz ayar", str(exc))
-            return
-        self._on_apply(changes)
-
 
 # --------------------------------------------------------------------------- #
 class ProfilesPage(QWidget):
@@ -317,9 +340,11 @@ class ProfilesPage(QWidget):
 
     DEFAULT_LABEL = "Varsayılan (profil yok)"
 
-    def __init__(self, client, on_changed):
+    def __init__(self, client, on_changed, apply_config=None, get_context=None):
         super().__init__()
         self.client = client
+        self._apply_config = apply_config  # apply_config(değişiklikler) -> korundu mu
+        self._context = get_context  # get_context() -> (gid, [gpu idleri], lact sürümü)
         self._on_changed = on_changed  # on_changed(etkin_profil, yapılandırma_değişti_mi)
         self.profiles, self.current, self.auto = [], None, False
         self._names = [None]
@@ -339,10 +364,13 @@ class ProfilesPage(QWidget):
         self.down_btn = QPushButton("Aşağı")
         self.hold_btn = QPushButton("Sabitle")
         self.release_btn = QPushButton("Sabitlemeyi kaldır")
+        self.export_btn = QPushButton("Dışa aktar…")
+        self.import_btn = QPushButton("İçe aktar…")
         for btn, slot in ((self.activate_btn, self.activate), (self.new_btn, self.new_profile),
                           (self.delete_btn, self.delete), (self.up_btn, lambda: self.move(-1)),
                           (self.down_btn, lambda: self.move(1)), (self.hold_btn, self.hold),
-                          (self.release_btn, self.release)):
+                          (self.release_btn, self.release), (self.export_btn, self.export_profile),
+                          (self.import_btn, self.import_profile)):
             btn.clicked.connect(slot)
             side.addWidget(btn)
         side.addStretch(1)
@@ -482,6 +510,105 @@ class ProfilesPage(QWidget):
         self._run(self.client.release_profile)
         self.reload()
 
+    # -- dışa / içe aktarma --
+    def export_profile(self):
+        row = self.selected()
+        if row is None or self._context is None:
+            return
+        name = self._names[row]
+        gid, device_ids, version = self._context()
+        rule = dict(self.profiles).get(name) if name is not None else None
+        gpus = {}
+        try:
+            if name == self.current:  # etkin profil: doğrulanmış okuma yolu
+                with waiting():
+                    gpus = {dev: self.client.get_config(dev) for dev in device_ids}
+            else:
+                with waiting():
+                    rule2, gpus = extract_profile(self.client.get_profile(name))
+                rule = rule2 or rule
+        except LactError as exc:
+            if name == self.current:
+                QMessageBox.warning(self, "Dışa aktar", str(exc))
+                return
+            gpus = {}
+        if not gpus:
+            QMessageBox.warning(
+                self, "Dışa aktar",
+                "Bu profilin içeriği daemon'dan okunamadı.\nProfili önce etkinleştirip tekrar dene.")
+            return
+        default_name = f"{name or 'varsayilan'}.json"
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Profili dışa aktar", default_name, "LACT profili (*.json)")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(dumps(build_export(name, rule, gpus, version)))
+        QMessageBox.information(self, "Dışa aktar", f"Profil kaydedildi:\n{path}")
+
+    def import_profile(self):
+        if self._context is None or self._apply_config is None:
+            return
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Profili içe aktar", "", "LACT profili (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as handle:
+                export = parse_export(handle.read())
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "İçe aktar", str(exc))
+            return
+        gid, device_ids, _version = self._context()
+        config, note = pick_config(export, gid, device_ids)
+        if config is None:
+            QMessageBox.warning(self, "İçe aktar", "Dosyada seçili ekran kartı için ayar yok.")
+            return
+        if note and not confirm(self, "Farklı ekran kartı", note + "\n\nYine de devam edilsin mi?"):
+            return
+        existing = [n for n, _r in self.profiles]
+        name, accepted = QInputDialog.getText(
+            self, "Profili içe aktar", "Profil adı:", text=unique_name(export["name"], existing))
+        name = (name or "").strip()
+        if not accepted or not name:
+            return
+        if name in existing:
+            QMessageBox.warning(self, "İçe aktar", f"'{name}' adında bir profil zaten var.")
+            return
+        # Daemon'da profil içeriğini doğrudan yazan komut yok: profili oluşturup etkinleştirir,
+        # ayarı olağan onay penceresiyle uygular, kuralı kaydeder ve istenirse önceki profile döneriz.
+        previous, previous_auto = self.current, self.auto
+        ok, _ = self._run(self.client.create_profile, name, None)
+        if not ok:
+            return
+        ok, _ = self._run(self.client.set_profile, name, False)
+        if not ok:
+            self.reload(select=name)
+            return
+        self._after(select=name)  # ana pencere yeni profilin yapılandırmasını okur
+        kept = self._apply_config(config_to_changes(self._current_config(), config))
+        if kept is not True:
+            QMessageBox.information(self, "İçe aktar",
+                                    f"'{name}' profili oluşturuldu ama ayarlar uygulanmadı.")
+            return
+        if export["rule"]:
+            self._run(self.client.set_profile_rule, name, export["rule"])
+        self.reload(select=name)
+        if previous != name and confirm(
+                self, "İçe aktar",
+                f"'{name}' profili içe aktarıldı ve etkinleştirildi.\n"
+                f"Önceki profile ('{previous or 'Varsayılan'}') dönülsün mü?"):
+            ok, _ = self._run(self.client.set_profile, previous, previous_auto)
+            if ok:
+                self._after()
+
+    def _current_config(self):
+        gid, _ids, _v = self._context()
+        try:
+            return self.client.get_config(gid)
+        except LactError:
+            return {}
+
     def fill_template(self, name):
         self.rule_edit.setPlainText(json.dumps(RULE_TEMPLATES[name], indent=2, ensure_ascii=False))
 
@@ -541,84 +668,38 @@ class ProcessesPage(QWidget):
 
 
 # --------------------------------------------------------------------------- #
-class SystemPage(QWidget):
-    """Overdrive, tanılama, GPU bağlantısı ve yapılandırmayı sıfırlama."""
+class SystemActions:
+    """Menüden çağrılan sistem işlemleri: Overdrive, tanılama, GPU bağlantısı, sıfırlama."""
 
-    def __init__(self, client, get_gid, on_changed):
-        super().__init__()
-        self.client, self.get_gid, self._on_changed = client, get_gid, on_changed
-        outer = QVBoxLayout(self)
-
-        od_box = QGroupBox("AMDGPU Overdrive")
-        od = QVBoxLayout(od_box)
-        self.od_status = QLabel(DASH)
-        od.addWidget(self.od_status)
-        self.od_on = QPushButton("Etkinleştir")
-        self.od_off = QPushButton("Devre dışı bırak")
-        self.od_on.clicked.connect(lambda: self._overdrive(True))
-        self.od_off.clicked.connect(lambda: self._overdrive(False))
-        od.addLayout(button_row(self.od_on, self.od_off))
-        outer.addWidget(od_box)
-
-        diag_box = QGroupBox("Tanılama")
-        diag = QVBoxLayout(diag_box)
-        self.snapshot_btn = QPushButton("Hata ayıklama snapshot'ı oluştur")
-        self.vbios_btn = QPushButton("VBIOS dökümünü kaydet…")
-        self.snapshot_btn.clicked.connect(self.snapshot)
-        self.vbios_btn.clicked.connect(self.vbios)
-        diag.addLayout(button_row(self.snapshot_btn, self.vbios_btn))
-        outer.addWidget(diag_box)
-
-        gpu_box = QGroupBox("GPU bağlantısı")
-        gpu = QVBoxLayout(gpu_box)
-        gpu.addWidget(QLabel("Sanal makineye aktarım (VFIO) için GPU sürücüden ayrılır.\n"
-                             "Ayırma sırasında ekran kararabilir."))
-        self.detach_btn = QPushButton("GPU'yu ayır")
-        self.attach_btn = QPushButton("GPU'yu yeniden bağla")
-        self.detach_btn.clicked.connect(lambda: self._attach(False))
-        self.attach_btn.clicked.connect(lambda: self._attach(True))
-        gpu.addLayout(button_row(self.detach_btn, self.attach_btn))
-        outer.addWidget(gpu_box)
-
-        cfg_box = QGroupBox("Yapılandırma")
-        cfg = QVBoxLayout(cfg_box)
-        self.reset_btn = QPushButton("Tüm LACT ayarlarını sıfırla")
-        self.reset_btn.clicked.connect(self.reset)
-        cfg.addLayout(button_row(self.reset_btn))
-        outer.addWidget(cfg_box)
-        outer.addStretch(1)
-
-    def set_system(self, system, flags):
-        od = system.get("amdgpu_overdrive_enabled")
-        self.od_status.setText("Durum: " + (DASH if od is None else ("etkin" if od else "kapalı")))
-        self.vbios_btn.setEnabled("DumpableVBios" in (flags or []))
+    def __init__(self, parent, client, get_gid, on_changed):
+        self.parent, self.client, self.get_gid, self._on_changed = parent, client, get_gid, on_changed
 
     def _call(self, title, fn, *args):
         try:
             with waiting():
                 return True, fn(*args)
         except LactError as exc:
-            QMessageBox.warning(self, title, str(exc))
+            QMessageBox.warning(self.parent, title, str(exc))
             return False, None
 
-    def _overdrive(self, enable):
-        text = ("Overdrive açılırken LACT çekirdek parametresini yazar ve initramfs'i yeniler "
+    def overdrive(self, enable):
+        text = ("Overclocking açılırken LACT çekirdek parametresini yazar ve initramfs'i yeniler "
                 "(birkaç dakika sürebilir).\nEtkisi için yeniden başlatma gerekir. Devam edilsin mi?"
                 if enable else
-                "Overdrive devre dışı bırakılacak. Etkisi için yeniden başlatma gerekir. "
+                "Overclocking devre dışı bırakılacak. Etkisi için yeniden başlatma gerekir. "
                 "Devam edilsin mi?")
-        if not confirm(self, "Overdrive", text):
+        if not confirm(self.parent, "Overclocking", text):
             return
-        ok, _ = self._call("Overdrive", self.client.enable_overdrive if enable
+        ok, _ = self._call("Overclocking", self.client.enable_overdrive if enable
                            else self.client.disable_overdrive)
         if ok:
-            QMessageBox.information(self, "Overdrive", "Tamamlandı. Yeniden başlatma gerekli.")
+            QMessageBox.information(self.parent, "Overclocking", "Tamamlandı. Yeniden başlatma gerekli.")
             self._on_changed()
 
     def snapshot(self):
         ok, result = self._call("Snapshot", self.client.generate_snapshot)
         if ok:
-            QMessageBox.information(self, "Snapshot oluşturuldu", str(result or "Tamamlandı."))
+            QMessageBox.information(self.parent, "Snapshot oluşturuldu", str(result or "Tamamlandı."))
 
     def vbios(self):
         gid = self.get_gid()
@@ -630,20 +711,22 @@ class SystemPage(QWidget):
         try:
             blob = vbios_to_bytes(data)
         except ValueError as exc:
-            QMessageBox.warning(self, "VBIOS", str(exc))
+            QMessageBox.warning(self.parent, "VBIOS", str(exc))
             return
-        path, _filter = QFileDialog.getSaveFileName(self, "VBIOS'u kaydet", "vbios.rom")
+        path, _filter = QFileDialog.getSaveFileName(self.parent, "VBIOS'u kaydet", "vbios.rom")
         if path:
             with open(path, "wb") as handle:
                 handle.write(blob)
-            QMessageBox.information(self, "VBIOS", f"{len(blob)} bayt kaydedildi:\n{path}")
+            QMessageBox.information(self.parent, "VBIOS", f"{len(blob)} bayt kaydedildi:\n{path}")
 
-    def _attach(self, attach):
+    def attach(self, attach):
         gid = self.get_gid()
         if not gid:
             return
-        if not attach and not confirm(self, "GPU'yu ayır",
-                                      "GPU sürücüden ayrılacak; ekran gidebilir. Devam edilsin mi?"):
+        if not attach and not confirm(
+                self.parent, "GPU'yu ayır",
+                "GPU sürücüden ayrılacak (sanal makineye aktarım için); ekran gidebilir. "
+                "Devam edilsin mi?"):
             return
         ok, _ = self._call("GPU bağlantısı", self.client.reattach_gpu if attach
                            else self.client.detach_gpu, gid)
@@ -651,12 +734,47 @@ class SystemPage(QWidget):
             self._on_changed()
 
     def reset(self):
-        if not confirm(self, "Ayarları sıfırla",
+        if not confirm(self.parent, "Ayarları sıfırla",
                        "Tüm LACT ayarları ve profiller silinebilir. Devam edilsin mi?"):
             return
         ok, _ = self._call("Sıfırlama", self.client.reset_config)
         if ok:
             self._on_changed()
+
+
+def ask_service_action(parent, state):
+    """lactd servisi için diyalog: 'enable' | 'start' | None."""
+    active, enabled = state.get("active"), state.get("enabled")
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Question)
+    if active and not enabled:
+        box.setWindowTitle("LACT servisi açılışta etkin değil")
+        box.setText("'lactd' servisi çalışıyor ama bilgisayar açılınca otomatik başlamıyor.")
+        box.setInformativeText("Etkinleştirirsen kaydettiğin ayarlar her açılışta uygulanır.\n"
+                               "Yönetici parolası istenecek.")
+    else:
+        box.setWindowTitle("LACT servisi çalışmıyor")
+        box.setText("GPU ayarlarını uygulayan 'lactd' servisi çalışmıyor.")
+        box.setInformativeText("Servisi başlatayım mı? Açılışta da etkinleştirirsen kaydettiğin "
+                               "ayarlar her açılışta otomatik uygulanır.\nYönetici parolası istenecek.")
+    enable_btn = start_btn = None
+    if not enabled:
+        enable_btn = box.addButton(
+            "Açılışta etkinleştir" if active else "Başlat ve açılışta etkinleştir",
+            QMessageBox.ButtonRole.AcceptRole)
+    if not active:
+        start_btn = box.addButton("Servisi başlat" if enabled else "Yalnızca şimdi başlat",
+                                  QMessageBox.ButtonRole.AcceptRole if enabled
+                                  else QMessageBox.ButtonRole.ActionRole)
+    box.addButton("Vazgeç", QMessageBox.ButtonRole.RejectRole)
+    box.setDefaultButton(enable_btn or start_btn)
+    box.exec()
+    clicked = box.clickedButton()
+    if enable_btn is not None and clicked is enable_btn:
+        return "enable"
+    if start_btn is not None and clicked is start_btn:
+        return "start"
+    return None
 
 
 # --------------------------------------------------------------------------- #

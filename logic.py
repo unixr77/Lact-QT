@@ -1,9 +1,14 @@
 """Arayüzden bağımsız yardımcı mantık (Qt gerektirmez, doğrudan test edilebilir)."""
 import base64
+import csv
+import io
 import json
 import math
 import time
 from collections import deque
+from datetime import datetime
+
+VERSION = "1.0.0"
 
 # ---------------------------------------------------------------- geçmiş --- #
 
@@ -38,6 +43,21 @@ class HistoryStore:
             if value is not None and age >= -window_s:
                 out.append((age, float(value)))
         return out
+
+
+def history_to_csv(store, window_s=None, now=None):
+    """Geçmiş örneklerini CSV metni olarak döndürür (ilk sütun yerel zaman)."""
+    now = time.time() if now is None else now
+    keys = store.keys()
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow(["zaman", *keys])
+    for ts, values in store.samples:
+        if window_s is not None and ts - now < -window_s:
+            continue
+        writer.writerow([datetime.fromtimestamp(ts).isoformat(timespec="seconds"),
+                         *["" if values.get(k) is None else values[k] for k in keys]])
+    return out.getvalue()
 
 
 def sample_from_stats(stats):

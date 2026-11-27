@@ -1,0 +1,14 @@
+post_install() {
+  echo "==> LACT servisini etkinleştir (ayarların her açılışta uygulanması için):"
+  echo "      sudo systemctl enable --now lactd.service"
+  echo "    ya da lact-qt'yi aç; servis çalışmıyorsa başlatmayı önerir."
+  echo "==> Overclocking için: lact-qt menüsünden 'Overclocking'i etkinleştir' ve yeniden başlat."
+}
+
+post_upgrade() {
+  echo "==> Güncelleme sonrası daemon'u yeniden başlat: sudo systemctl restart lactd.service"
+}
+
+pre_remove() {
+  systemctl disable --now lactd.service >/dev/null 2>&1 || true
+}

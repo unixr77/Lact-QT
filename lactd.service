@@ -1,0 +1,12 @@
+[Unit]
+Description=LACT GPU Control Daemon
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/bin/lact daemon
+Nice=-5
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=LACT
+Name[tr]=LACT
+GenericName=GPU Control
+GenericName[tr]=Ekran Kartı Denetimi
+Comment=Monitor and tune your graphics card
+Comment[tr]=Ekran kartını izle; fan, güç, saat ve voltajı ayarla
+Exec=lact-qt
+Icon=lact-qt
+Terminal=false
+StartupNotify=true
+StartupWMClass=lact-qt
+Categories=System;Settings;HardwareSettings;Qt;
+Keywords=gpu;amd;radeon;fan;overclock;undervolt;lact;

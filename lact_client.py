@@ -10,6 +10,20 @@ class LactError(Exception):
     """Daemon'a ulaşılamadı ya da daemon hata döndürdü."""
 
 
+class LactUnreachable(LactError):
+    """Daemon'a bağlanılamadı. reason: missing | refused | denied | other."""
+
+    def __init__(self, message, reason="other"):
+        super().__init__(message)
+        self.reason = reason
+
+
+def is_tcp_address(addr):
+    """'host:port' biçimindeki adresler TCP, '/' ile başlayanlar unix soketidir."""
+    return (bool(addr) and not addr.startswith("/") and ":" in addr
+            and addr.rsplit(":", 1)[1].isdigit())
+
+
 def _error_text(data):
     # Daemon hataları {"description": ..., "source": {"description": ...}} zinciri olarak gelir.
     parts = []
@@ -41,15 +55,39 @@ class LactClient:
         self.path = path
         self.timeout = timeout
 
+    @property
+    def is_remote(self):
+        return is_tcp_address(self.path)
+
+    def _connect(self, timeout):
+        try:
+            if self.is_remote:
+                host, port = self.path.rsplit(":", 1)
+                return socket.create_connection((host.strip("[]"), int(port)), timeout=timeout)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            try:
+                sock.connect(self.path)
+            except OSError:
+                sock.close()
+                raise
+            return sock
+        except FileNotFoundError as exc:
+            raise LactUnreachable(f"{self.path}: {exc}", "missing") from exc
+        except ConnectionRefusedError as exc:
+            raise LactUnreachable(f"{self.path}: {exc}", "refused") from exc
+        except PermissionError as exc:
+            raise LactUnreachable(f"{self.path}: {exc}", "denied") from exc
+        except OSError as exc:
+            raise LactUnreachable(f"{self.path}: {exc}", "other") from exc
+
     def call(self, command, args=None, timeout=None):
         request = {"command": command}
         if args is not None:
             request["args"] = args
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(timeout or self.timeout)
+        sock = self._connect(timeout or self.timeout)
         buf = bytearray()
         try:
-            sock.connect(self.path)
             sock.sendall((json.dumps(request) + "\n").encode())
             while not buf.endswith(b"\n"):
                 chunk = sock.recv(65536)
@@ -122,6 +160,10 @@ class LactClient:
     def list_profiles(self):
         return self.call("list_profiles", {"include_state": False}) or {}
 
+    def get_profile(self, name):
+        """name=None varsayılan profil. Argüman biçimi DOĞRULANMADI."""
+        return self.call("get_profile", {"name": name})
+
     def set_profile(self, name, auto_switch=False):
         """name=None varsayılan profili (ayarsız) etkinleştirir."""
         self.call("set_profile", {"name": name, "auto_switch": bool(auto_switch)})
@@ -168,6 +210,9 @@ class LactClient:
 
     def reattach_gpu(self, gid):
         return self.call("reattach_gpu", {"id": gid})
+
+    def reset_pmfw(self, gid):
+        return self.call("reset_pmfw", {"id": gid})
 
     def reset_config(self):
         # Daemon'daki komut adı gerçekten "rest_config" (sürüm 0.10.1).

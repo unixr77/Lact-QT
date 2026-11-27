@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""LACT için Qt6 (PySide6) arayüzü — aşama 3.
+"""LACT için Qt6 (PySide6) arayüzü.
 
-Sekmeler: Bilgi, İzleme, Geçmiş, Güç, Durumlar, Hız aşırtma, Fan, Profiller, Süreçler, Sistem.
+Sekmeler: Bilgi, İzleme (canlı + geçmiş), Güç, Fan, Profiller, Süreçler; sistem işlemleri ☰ menüsünde.
 Donanıma dokunan her şeyi lactd yapar; bu program yalnızca daemon'un JSON
 soketine bağlanan bir istemcidir. Yapılandırma okunur, değiştirilir ve
 bütünüyle geri yazılır, bu yüzden bilmediğimiz anahtarlar korunur.
@@ -16,17 +16,20 @@ from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QProgressBar,
-    QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QTabWidget,
-    QVBoxLayout, QWidget,
+    QInputDialog, QMenu, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
+    QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from curve import DEFAULT_CURVE, CurveModel
 from extra_pages import (
-    HistoryPage, ProcessesPage, ProfilesPage, StatesPage, SystemPage, VulkanDialog,
+    HistoryPage, ProcessesPage, ProfilesPage, StatesPage, SystemActions, VulkanDialog,
+    ask_service_action,
 )
-from lact_client import DEFAULT_SOCKET, LactClient, LactError, with_changes
-from logic import display_rows
-from ui_common import DASH, dig, gib, group, selectable
+from lact_client import DEFAULT_SOCKET, LactClient, LactError, is_tcp_address, with_changes
+from logic import VERSION, display_rows
+from prefs import Prefs
+from service import ServiceController, wait_for_socket
+from ui_common import DASH, confirm, dig, gib, group, waiting
 
 LEVELS = ["auto", "low", "high", "manual"]
 POLL_MS = 1000
@@ -46,13 +49,6 @@ PMFW_ROWS = [
     ("minimum_pwm", "minimum_pwm", "Asgari fan hızı", " %"),
     ("zero_rpm_threshold", "zero_rpm_temperature", "Zero RPM sıcaklığı", " °C"),
 ]
-
-
-def fmt_state(value):
-    """Güç durumu: {'Index': 1} -> '#1', None -> '—', metin -> olduğu gibi."""
-    if isinstance(value, dict) and "Index" in value:
-        return f"#{value['Index']}"
-    return DASH if value is None else str(value)
 
 
 def rdna_table(clocks):
@@ -199,13 +195,10 @@ class StatsPage(QWidget):
         self.vram_clock = QLabel(DASH)
         self.voltage = QLabel(DASH)
         self.fan = QLabel(DASH)
-        self.level = QLabel(DASH)
-        self.states = QLabel(DASH)
         self.throttle = QLabel(DASH)
         for name, widget in (("GPU saati", self.gpu_clock), ("VRAM saati", self.vram_clock),
                              ("GPU voltajı", self.voltage), ("Fan", self.fan),
-                             ("Performans seviyesi", self.level),
-                             ("Güç durumu", self.states), ("Kısılma", self.throttle)):
+                             ("Kısılma", self.throttle)):
             misc.addRow(f"{name}:", widget)
         outer.addWidget(misc_box)
 
@@ -214,6 +207,12 @@ class StatsPage(QWidget):
         self.temp_rows = {}
         outer.addWidget(temp_box)
         outer.addStretch(1)
+
+    def reset_temps(self):
+        """Başka karta geçince eski sensör satırlarını kaldırır."""
+        for label in self.temp_rows.values():
+            self.temp_form.removeRow(label)
+        self.temp_rows = {}
 
     def update_stats(self, s):
         self.busy.setValue(int(dig(s, "busy_percent", default=0)))
@@ -243,10 +242,6 @@ class StatsPage(QWidget):
             f"{rpm} RPM" if rpm is not None else DASH, mode,
             f", PWM {pwm}" if pwm is not None else ""))
 
-        self.level.setText(str(s.get("performance_level", DASH)))
-        ps = s.get("active_power_states") or {}
-        self.states.setText("GPU: {}, VRAM: {}".format(
-            fmt_state(ps.get("core")), fmt_state(ps.get("memory"))) if ps else DASH)
         thr = s.get("throttle_info") or {}
         self.throttle.setText(", ".join(f"{k}: {v}" for k, v in thr.items()) if thr else "Yok")
 
@@ -267,9 +262,8 @@ class StatsPage(QWidget):
 class PerfPage(QWidget):
     """Güç sınırı ve performans seviyesi."""
 
-    def __init__(self, on_apply, on_reload):
+    def __init__(self):
         super().__init__()
-        self._on_apply = on_apply
         outer = QVBoxLayout(self)
 
         cap_box = QGroupBox("Güç sınırı")
@@ -294,16 +288,6 @@ class PerfPage(QWidget):
         lvl_form.addRow("Seviye:", self.level)
         outer.addWidget(lvl_box)
 
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        self.reload_btn = QPushButton("Geri yükle")
-        self.apply_btn = QPushButton("Uygula")
-        self.reload_btn.clicked.connect(on_reload)
-        self.apply_btn.clicked.connect(self._apply)
-        buttons.addWidget(self.reload_btn)
-        buttons.addWidget(self.apply_btn)
-        outer.addLayout(buttons)
-        outer.addStretch(1)
 
     def load(self, stats, config):
         power = dig(stats, "power", default={})
@@ -327,24 +311,16 @@ class PerfPage(QWidget):
         return {"power_cap": float(self.cap_spin.value()),
                 "performance_level": self.level.currentText()}
 
-    def _apply(self):
-        self._on_apply(self.collect())
-
 
 # --------------------------------------------------------------------------- #
-class OcPage(QScrollArea):
+class OcPage(QWidget):
     """GPU saat ofseti, voltaj ofseti (düşük voltaj / undervolt) ve azami VRAM saati."""
 
-    def __init__(self, on_apply, on_reload):
+    def __init__(self):
         super().__init__()
-        self._on_apply = on_apply
         self._config = {}
         self._supported = {}
-        self.setWidgetResizable(True)
-        self.setFrameShape(QScrollArea.Shape.NoFrame)
-
-        body = QWidget()
-        outer = QVBoxLayout(body)
+        outer = QVBoxLayout(self)
         self.status = QLabel(DASH)
         outer.addWidget(self.status)
 
@@ -364,21 +340,7 @@ class OcPage(QScrollArea):
         form.addRow("", self.mem_hint)
         outer.addWidget(box)
 
-        outer.addWidget(QLabel(
-            "Kararsızlık görürsen 'Özel değer' kutularının işaretini kaldırıp Uygula'ya bas;\n"
-            "ayarlar varsayılana döner."))
-
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        self.reload_btn = QPushButton("Geri yükle")
-        self.apply_btn = QPushButton("Uygula")
-        self.reload_btn.clicked.connect(on_reload)
-        self.apply_btn.clicked.connect(self._apply)
-        buttons.addWidget(self.reload_btn)
-        buttons.addWidget(self.apply_btn)
-        outer.addLayout(buttons)
-        outer.addStretch(1)
-        self.setWidget(body)
+        outer.addWidget(QLabel("Özel değer kutusunun işaretini kaldırmak ayarı varsayılana döndürür."))
 
     def load(self, config, clocks, ratio, overdrive):
         self._config = copy.deepcopy(config)
@@ -415,8 +377,6 @@ class OcPage(QScrollArea):
                 "Şu an etkin:  GPU ofseti {} MHz  •  voltaj ofseti {} mV  •  azami VRAM {} MHz".format(
                     data.get("sclk_offset", DASH), data.get("voltage_offset", DASH),
                     dig(data, "current_mclk_range", "max", default=DASH)))
-        if overdrive is False:
-            self.status.setText(self.status.text() + "\nUyarı: amdgpu Overdrive kapalı görünüyor.")
 
     def collect(self):
         changes = {}
@@ -433,9 +393,6 @@ class OcPage(QScrollArea):
         if self._supported.get("mem"):
             changes["max_memory_clock"] = self.mem.value()
         return changes
-
-    def _apply(self):
-        self._on_apply(self.collect())
 
 
 # --------------------------------------------------------------------------- #
@@ -591,7 +548,7 @@ class CurveEditor(QWidget):
 class FanPage(QScrollArea):
     """Fan kontrolü: sürücü (PMFW), statik hız veya özel eğri."""
 
-    def __init__(self, on_apply, on_reload):
+    def __init__(self, on_apply, on_reload, on_reset_pmfw=None):
         super().__init__()
         self._on_apply = on_apply
         self._settings = dict(DEFAULT_FAN)
@@ -667,6 +624,10 @@ class FanPage(QScrollArea):
             pmfw_form.addRow(f"{title}:", widget)
         pmfw_form.addRow(QLabel(
             "Özel eğri ya da statik hız seçiliyse bu ayarlar uygulanmaz."))
+        self.pmfw_reset = QPushButton("Sürücü ayarlarını sıfırla")
+        if on_reset_pmfw:
+            self.pmfw_reset.clicked.connect(on_reset_pmfw)
+        pmfw_form.addRow(self.pmfw_reset)
         outer.addWidget(self.pmfw_box)
 
         buttons = QHBoxLayout()
@@ -824,10 +785,100 @@ class ConfirmDialog(QDialog):
 
 
 # --------------------------------------------------------------------------- #
+class TuningPage(QScrollArea):
+    """Güç sınırı, saat/voltaj ve (gelişmiş) güç durumları tek sayfada, tek Uygula düğmesiyle."""
+
+    def __init__(self, on_apply, on_reload, on_overdrive):
+        super().__init__()
+        self._on_apply = on_apply
+        self.setWidgetResizable(True)
+        self.setFrameShape(QScrollArea.Shape.NoFrame)
+        body = QWidget()
+        outer = QVBoxLayout(body)
+
+        self.od_box = QGroupBox("Overclocking kapalı")
+        od = QHBoxLayout(self.od_box)
+        od.addWidget(QLabel("Saat ve voltaj ayarları için sürücüde Overdrive açılmalı "
+                            "(yeniden başlatma gerekir)."), 1)
+        self.od_btn = QPushButton("Etkinleştir")
+        self.od_btn.clicked.connect(on_overdrive)
+        od.addWidget(self.od_btn)
+        outer.addWidget(self.od_box)
+
+        self.perf = PerfPage()
+        self.oc = OcPage()
+        outer.addWidget(self.perf)
+        outer.addWidget(self.oc)
+
+        self.adv = QGroupBox("Gelişmiş: güç durumları ve profil modu")
+        self.adv.setCheckable(True)
+        self.adv.setChecked(False)
+        adv_lay = QVBoxLayout(self.adv)
+        self.states = StatesPage()
+        adv_lay.addWidget(self.states)
+        self.states.setVisible(False)
+        self.adv.toggled.connect(self.states.setVisible)
+        outer.addWidget(self.adv)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.reload_btn = QPushButton("Geri yükle")
+        self.apply_btn = QPushButton("Uygula")
+        self.reload_btn.clicked.connect(on_reload)
+        self.apply_btn.clicked.connect(self._apply)
+        buttons.addWidget(self.reload_btn)
+        buttons.addWidget(self.apply_btn)
+        outer.addLayout(buttons)
+        outer.addStretch(1)
+        self.setWidget(body)
+
+    def load(self, stats, config, clocks, ratio, overdrive, states, modes):
+        self.perf.load(stats, config)
+        self.oc.load(config, clocks, ratio, overdrive)
+        self.states.load(states, modes, config)
+        self.od_box.setVisible(overdrive is False)
+
+    def collect(self):
+        changes = {}
+        changes.update(self.perf.collect())
+        changes.update(self.oc.collect())
+        if self.adv.isChecked():  # kapalıyken güç durumlarına dokunulmaz
+            changes.update(self.states.collect())
+        return changes
+
+    def _apply(self):
+        try:
+            changes = self.collect()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Geçersiz ayar", str(exc))
+            return
+        self._on_apply(changes)
+
+
+class MonitorPage(QScrollArea):
+    """Canlı değerler ve geçmiş grafikleri tek kaydırılabilir sayfada."""
+
+    def __init__(self, stats_page, history_page):
+        super().__init__()
+        self.setWidgetResizable(True)
+        self.setFrameShape(QScrollArea.Shape.NoFrame)
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.addWidget(stats_page)
+        lay.addWidget(history_page)
+        self.setWidget(body)
+
+
+# --------------------------------------------------------------------------- #
 class MainWindow(QMainWindow):
-    def __init__(self, client):
+    def __init__(self, client, prefs=None, service=None):
         super().__init__()
         self.client = client
+        self.prefs = prefs if prefs is not None else Prefs()
+        self.service = service if service is not None else ServiceController()
+        self._service_prompted = False
+        self._denied_shown = False
+        self._tab_restored = False
         self.devices = []
         self.system = {}
         self.gid = None
@@ -840,36 +891,43 @@ class MainWindow(QMainWindow):
         self.config = {}
 
         self.setWindowTitle("LACT")
-        self.setWindowIcon(QIcon.fromTheme("preferences-desktop-display"))
-        self.resize(900, 780)
+        self.setWindowIcon(QIcon.fromTheme("lact-qt", QIcon.fromTheme("preferences-desktop-display")))
+        self.resize(int(self.prefs.get("width", 860)), int(self.prefs.get("height", 760)))
 
         central = QWidget()
         lay = QVBoxLayout(central)
         top = QHBoxLayout()
-        top.addWidget(QLabel("Ekran kartı:"))
+        self.gpu_label = QLabel("Ekran kartı:")
         self.gpu_box = QComboBox()
         self.gpu_box.currentIndexChanged.connect(self._gpu_selected)
+        top.addWidget(self.gpu_label)
         top.addWidget(self.gpu_box, 1)
+        top.addStretch(1)
         self.profile_label = QLabel("Profil: " + DASH)
         top.addWidget(self.profile_label)
+        self.menu_btn = QToolButton()
+        self.menu_btn.setText("☰")
+        self.menu_btn.setToolTip("Menü")
+        self.menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        top.addWidget(self.menu_btn)
         lay.addLayout(top)
+
+        self.sysactions = SystemActions(self, client, lambda: self.gid, self.on_system_changed)
+        self._build_menu()
 
         self.info_page = InfoPage(self.show_vulkan)
         self.stats_page = StatsPage()
-        self.history_page = HistoryPage()
-        self.perf_page = PerfPage(self.apply_config, self.reload_config)
-        self.states_page = StatesPage(self.apply_config, self.reload_config)
-        self.oc_page = OcPage(self.apply_config, self.reload_config)
-        self.fan_page = FanPage(self.apply_config, self.reload_config)
-        self.profiles_page = ProfilesPage(client, self.on_profile_changed)
+        self.history_page = HistoryPage(self.prefs)
+        self.monitor_page = MonitorPage(self.stats_page, self.history_page)
+        self.tuning_page = TuningPage(self.apply_config, self.reload_config, self.toggle_overdrive)
+        self.fan_page = FanPage(self.apply_config, self.reload_config, self.reset_pmfw)
+        self.profiles_page = ProfilesPage(client, self.on_profile_changed, self.apply_config,
+                                          self._profile_context)
         self.proc_page = ProcessesPage()
-        self.system_page = SystemPage(client, lambda: self.gid, self.on_system_changed)
         self.tabs = QTabWidget()
-        for page, title in ((self.info_page, "Bilgi"), (self.stats_page, "İzleme"),
-                            (self.history_page, "Geçmiş"), (self.perf_page, "Güç"),
-                            (self.states_page, "Durumlar"), (self.oc_page, "Hız aşırtma"),
-                            (self.fan_page, "Fan"), (self.profiles_page, "Profiller"),
-                            (self.proc_page, "Süreçler"), (self.system_page, "Sistem")):
+        for page, title in ((self.info_page, "Bilgi"), (self.monitor_page, "İzleme"),
+                            (self.tuning_page, "Güç"), (self.fan_page, "Fan"),
+                            (self.profiles_page, "Profiller"), (self.proc_page, "Süreçler")):
             self.tabs.addTab(page, title)
         self.tabs.currentChanged.connect(self._tab_changed)
         lay.addWidget(self.tabs, 1)
@@ -880,27 +938,84 @@ class MainWindow(QMainWindow):
         self.proc_timer = QTimer(self)
         self.proc_timer.timeout.connect(self.refresh_processes)
 
+    # -- menü --
+    def _build_menu(self):
+        menu = QMenu(self.menu_btn)
+        self.menu_btn.setMenu(menu)
+
+        def add(text, slot):
+            action = menu.addAction(text)
+            action.triggered.connect(lambda *_: slot())
+            return action
+
+        self.act_remote = add("Uzak daemon'a bağlan…", self.connect_remote)
+        self.act_local = add("Yerel daemon'a dön", self.connect_local)
+        menu.addSeparator()
+        self.act_od = add("Overclocking'i etkinleştir", self.toggle_overdrive)
+        self.act_service = add("LACT servisini yönet…", self.manage_service)
+        menu.addSeparator()
+        self.act_snapshot = add("Hata ayıklama snapshot'ı oluştur", self.sysactions.snapshot)
+        self.act_vbios = add("VBIOS'u kaydet…", self.sysactions.vbios)
+        self.act_detach = add("GPU'yu ayır", lambda: self.sysactions.attach(False))
+        self.act_attach = add("GPU'yu yeniden bağla", lambda: self.sysactions.attach(True))
+        self.act_reset = add("Tüm ayarları sıfırla", self.sysactions.reset)
+        menu.addSeparator()
+        self.act_about = add("Hakkında", self.show_about)
+
+    def _update_menu(self):
+        flags = self.info.get("flags") or []
+        od = self.system.get("amdgpu_overdrive_enabled")
+        self.act_od.setText("Overclocking'i devre dışı bırak" if od else "Overclocking'i etkinleştir")
+        self.act_od.setEnabled(od is not None)
+        self.act_vbios.setEnabled("DumpableVBios" in flags)
+        self.act_local.setVisible(self.client.is_remote)
+        self.setWindowTitle(f"LACT — {self.client.path}" if self.client.is_remote else "LACT")
+
     # -- bağlantı ve yükleme --
     def connect_daemon(self):
         try:
             self.devices = self.client.devices()
             self.system = self.client.system_info()
         except LactError as exc:
+            reason = getattr(exc, "reason", None)
+            if not self.client.is_remote and reason in ("missing", "refused") \
+                    and not self._service_prompted:
+                self._offer_service()
+                QTimer.singleShot(300, self.connect_daemon)
+                return
+            if reason == "denied" and not self._denied_shown:
+                self._denied_shown = True
+                QMessageBox.warning(
+                    self, "Soket erişimi reddedildi",
+                    "lactd soketine erişim izni yok.\\nKullanıcın lactd'nin yetkili grubunda "
+                    "(varsayılan: wheel) olmalı ya da /etc/lact/config.yaml içinde admin_user "
+                    "ayarlanmalı; ardından servisi yeniden başlat.")
             self.statusBar().showMessage(
                 f"lactd'ye bağlanılamadı ({exc}). 3 sn sonra yeniden denenecek…")
             QTimer.singleShot(3000, self.connect_daemon)
             return
+        previous = self.gid
         self.gpu_box.blockSignals(True)
         self.gpu_box.clear()
         for dev in self.devices:
             self.gpu_box.addItem(dev.get("name", dev.get("id", "?")))
+        # Yeniden bağlanınca (profil/sistem değişikliği) seçili kart korunur
+        index = next((i for i, d in enumerate(self.devices) if d.get("id") == previous), 0)
+        if self.devices:
+            self.gpu_box.setCurrentIndex(index)
         self.gpu_box.blockSignals(False)
         if self.devices:
-            self.load_gpu(0)
+            self.load_gpu(index)
         else:
             self.gid = None
             self.statusBar().showMessage("lactd hiç GPU bulamadı.")
+        self._update_menu()
         self.profiles_page.reload()
+        if not self._tab_restored:
+            self._tab_restored = True
+            tab = self.prefs.get("tab", 0)
+            if isinstance(tab, int) and 0 <= tab < self.tabs.count():
+                self.tabs.setCurrentIndex(tab)
 
     def _gpu_selected(self, index):
         if 0 <= index < len(self.devices):
@@ -924,15 +1039,16 @@ class MainWindow(QMainWindow):
     def _fill_pages(self):
         flags = self.info.get("flags") or []
         ratio = dig(self.info, "drm_info", "vram_clock_ratio", default=1.0)
-        self.perf_page.load(self.stats, self.config)
-        self.states_page.load(self.states, self.modes, self.config)
-        self.oc_page.load(self.config, self.clocks, ratio,
-                          self.system.get("amdgpu_overdrive_enabled"))
+        self.tuning_page.load(self.stats, self.config, self.clocks, ratio,
+                              self.system.get("amdgpu_overdrive_enabled"), self.states, self.modes)
         self.fan_page.load(self.stats, self.config, flags)
-        self.system_page.set_system(self.system, flags)
+        self._update_menu()
 
     def load_gpu(self, index):
-        self.gid = self.devices[index]["id"]
+        previous, self.gid = self.gid, self.devices[index]["id"]
+        if previous != self.gid:  # farklı karta geçildi: eski kartın verisi karışmasın
+            self.history_page.clear()
+            self.stats_page.reset_temps()
         try:
             self.info = self.client.device_info(self.gid)
             self._fetch()
@@ -968,8 +1084,72 @@ class MainWindow(QMainWindow):
             return
         self._fill_pages()
 
+    # -- systemd servisi --
+    def _run_service_dialog(self, state):
+        action = ask_service_action(self, state)
+        if action is None:
+            return False
+        with waiting():
+            ok, message = self.service.start(enable=(action == "enable"))
+            if ok:
+                wait_for_socket()
+        if not ok:
+            QMessageBox.warning(self, "Servis başlatılamadı", message)
+            return False
+        self.statusBar().showMessage("LACT servisi başlatıldı.")
+        return True
+
+    def _offer_service(self):
+        self._service_prompted = True
+        state = self.service.state()
+        if not state["installed"]:
+            QMessageBox.warning(self, "LACT servisi bulunamadı",
+                                "lactd.service sistemde kurulu değil.\\n"
+                                "lact-qt paketini kurduğundan emin ol.")
+            return False
+        if state["active"]:
+            return False  # çalışıyor; bağlantı yeniden denenecek
+        return self._run_service_dialog(state)
+
+    def manage_service(self):
+        if self.client.is_remote:
+            QMessageBox.information(self, "LACT servisi",
+                                    "Uzak daemon'a bağlıyken yerel servis yönetilemez.")
+            return
+        state = self.service.state()
+        if not state["installed"]:
+            QMessageBox.warning(self, "LACT servisi bulunamadı",
+                                "lactd.service sistemde kurulu değil.")
+            return
+        if state["active"] and state["enabled"]:
+            QMessageBox.information(self, "LACT servisi",
+                                    "Servis çalışıyor ve bilgisayar açılınca otomatik başlıyor.")
+            return
+        if self._run_service_dialog(state):
+            self.connect_daemon()
+
+    # -- uzak bağlantı --
+    def connect_remote(self):
+        text, accepted = QInputDialog.getText(
+            self, "Uzak daemon", "Adres (host:port):", text=str(self.prefs.get("remote", "")))
+        address = (text or "").strip()
+        if not accepted or not address:
+            return
+        if not is_tcp_address(address):
+            QMessageBox.warning(self, "Uzak daemon", "Adres 'host:port' biçiminde olmalı.")
+            return
+        self.prefs.set("remote", address)
+        self.client.path = address
+        self.connect_daemon()
+
+    def connect_local(self):
+        self.client.path = DEFAULT_SOCKET
+        self._service_prompted = False
+        self.connect_daemon()
+
     # -- sekmeler --
     def _tab_changed(self, index):
+        self.prefs.set("tab", index)
         page = self.tabs.widget(index)
         if page is self.proc_page:
             self.refresh_processes()
@@ -997,6 +1177,15 @@ class MainWindow(QMainWindow):
             return
         VulkanDialog(self, api).exec()
 
+    def show_about(self):
+        QMessageBox.about(
+            self, "LACT hakkında",
+            f"LACT Qt arayüzü {VERSION}\\nDaemon: LACT {self.system.get('version', DASH)}\\n"
+            f"Bağlantı: {self.client.path}")
+
+    def _profile_context(self):
+        return self.gid, [d["id"] for d in self.devices], self.system.get("version")
+
     def on_profile_changed(self, current, config_changed):
         self.profile_label.setText(f"Profil: {current or 'Varsayılan'}")
         if config_changed:
@@ -1006,32 +1195,64 @@ class MainWindow(QMainWindow):
         """Overdrive, GPU ayırma ya da sıfırlama sonrası her şeyi baştan okur."""
         self.connect_daemon()
 
+    def toggle_overdrive(self):
+        self.sysactions.overdrive(not self.system.get("amdgpu_overdrive_enabled"))
+
+    def reset_pmfw(self):
+        if not self.gid or not confirm(
+                self, "Sürücü fan ayarları",
+                "Sürücünün fan ayarları (akustik limit, hedef sıcaklık, zero RPM…) "
+                "varsayılana döndürülsün mü?"):
+            return
+        try:
+            with waiting():
+                self.client.reset_pmfw(self.gid)
+        except LactError as exc:
+            QMessageBox.warning(self, "Sürücü fan ayarları", str(exc))
+            return
+        self.reload_config()
+
     # -- ayar uygulama --
     def apply_config(self, changes):
+        """Ayarı uygular; korundu mu (True/False) döndürür, hata olursa None."""
         new_config = with_changes(self.config, **changes)
         try:
             seconds = self.client.set_config(self.gid, new_config)
         except LactError as exc:
             QMessageBox.critical(self, "Ayar uygulanamadı", str(exc))
-            return
+            return None
         keep = ConfirmDialog(self, seconds).exec() == QDialog.DialogCode.Accepted
         try:
             self.client.confirm(keep)
         except LactError:
             pass  # süre dolduysa daemon ayarı zaten geri aldı
         self.reload_config()
-        self.statusBar().showMessage("Ayarlar korundu." if keep else "Ayarlar geri alındı.")
+        self.statusBar().showMessage(
+            "Ayarlar korundu ve kaydedildi." if keep else "Ayarlar geri alındı.")
+        return keep
+
+    def closeEvent(self, event):
+        self.prefs.set("width", self.width())
+        self.prefs.set("height", self.height())
+        self.prefs.set("tab", self.tabs.currentIndex())
+        self.prefs.save()
+        super().closeEvent(event)
 
 
 def main():
     parser = argparse.ArgumentParser(description="LACT için Qt arayüzü")
-    parser.add_argument("--socket", default=DEFAULT_SOCKET, help="lactd soket yolu")
+    parser.add_argument("--socket", default=DEFAULT_SOCKET, help="lactd unix soket yolu")
+    parser.add_argument("--tcp-address", metavar="HOST:PORT",
+                        help="uzak lactd'ye TCP ile bağlan")
     args, qt_args = parser.parse_known_args()
+    address = args.tcp_address or args.socket
+    if args.tcp_address and not is_tcp_address(args.tcp_address):
+        parser.error("--tcp-address 'host:port' biçiminde olmalı")
 
     app = QApplication([sys.argv[0], *qt_args])
     app.setApplicationName("lact-qt")
     app.setDesktopFileName("lact-qt")
-    window = MainWindow(LactClient(args.socket))
+    window = MainWindow(LactClient(address))
     window.show()
     QTimer.singleShot(0, window.connect_daemon)
     sys.exit(app.exec())
