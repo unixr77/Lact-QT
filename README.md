@@ -3,6 +3,14 @@
 LACT QT: LACT'ın GTK4/libadwaita arayüzü yerine Qt6 (PySide6) arayüzü. Donanıma dokunan `lactd`
 daemon'u, LACT'ın kaynak kodundan GUI'siz derlenip pakete eklenir; resmi `lact` paketi gerekmez.
 
+## Ekran Görüntüleri
+
+| | |
+| :---: | :---: |
+| ![Ekran Görüntüsü 1](preview/Ekran%20G%C3%B6r%C3%BCnt%C3%BCs%C3%BC_20261128_004154.png) | ![Ekran Görüntüsü 2](preview/Ekran%20G%C3%B6r%C3%BCnt%C3%BCs%C3%BC_20261128_004218.png) |
+| ![Ekran Görüntüsü 3](preview/Ekran%20G%C3%B6r%C3%BCnt%C3%BCs%C3%BC_20261128_004230.png) | ![Ekran Görüntüsü 4](preview/Ekran%20G%C3%B6r%C3%BCnt%C3%BCs%C3%BC_20261128_004252.png) |
+| ![Ekran Görüntüsü 5](preview/Ekran%20G%C3%B6r%C3%BCnt%C3%BCs%C3%BC_20261128_004319.png) | ![Ekran Görüntüsü 6](preview/Ekran%20G%C3%B6r%C3%BCnt%C3%BCs%C3%BC_20261128_004329.png) |
+
 ## Kurulum (Arch / CachyOS)
     bash install.sh
 
@@ -29,3 +37,6 @@ dönmeyi sorar.
     lact-qt --tcp-address 192.168.1.10:12853
 
 (daemon tarafında `/etc/lact/config.yaml` içinde `tcp_listen_address` ayarlanmalı.)
+```[cite: 1]
+
+*(Not: Dosya adlarındaki boşluk ve Türkçe karakterlerin GitHub Markdown'da sorunsuz çalışması için URL kodlaması (`%20`, `%C3%B6` vb.) uygulanmıştır. Dilerseniz tablo hücrelerine görsellerin alt başlıklarını da ekleyebiliriz.)*
