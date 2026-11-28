@@ -14,6 +14,11 @@ daemon'u, LACT'ın kaynak kodundan GUI'siz derlenip pakete eklenir; resmi `lact`
 ## Kurulum (Arch / CachyOS)
     bash install.sh
 
+## or run without insatll
+    sudo pacman -S pyside6
+    python lact_qt.py
+
+    
 Resmi `lact` kuruluysa pacman kaldırmayı sorar. `/etc/lact/config.yaml` korunur, eski
 ayarların aynen devam eder.
 
