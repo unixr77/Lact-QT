@@ -30,6 +30,11 @@ Profiller sekmesinden profil dışa/içe aktarılır (JSON). İçe aktarma, daem
 olmadığı için profili oluşturup etkinleştirir, ayarı olağan onay penceresiyle uygular ve önceki profile
 dönmeyi sorar.
 
+## Otomatik profil kuralları
+Profiller sekmesinde bir profil seçip kural belirleyebilirsin: belirli bir süreç çalışırken ya da
+GameMode etkinken o profil kendiliğinden etkinleşir ("Kurallara göre otomatik profil değiştir"
+açık olmalı). Ayarlar, o sırada etkin olan profile kaydedilir.
+
 ## Kaldırma
     sudo pacman -Rns lact-qt
 
