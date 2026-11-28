@@ -2,7 +2,6 @@
 import base64
 import csv
 import io
-import json
 import math
 import time
 from collections import deque
@@ -179,10 +178,40 @@ def heuristics_from_cells(cells):
 
 
 # ------------------------------------------------------------------ profiller --- #
-RULE_TEMPLATES = {
-    "Süreç": {"type": "process", "filter": {"name": "vkcube"}},
-    "Gamemode": {"type": "gamemode"},
-}
+RULE_KINDS = ["Kural yok (elle seçilir)", "Belirli bir süreç çalışırken", "GameMode etkinken"]
+
+
+def rule_to_form(rule):
+    """Profil kuralını forma çevirir -> (tür_indeksi, süreç_adı, argümanlar, basit_mi).
+
+    Form yalnızca 'süreç' ve 'gamemode' kurallarını düzenler; ve/veya gibi karmaşık
+    kurallar için basit_mi=False döner ve kural olduğu gibi korunur.
+    """
+    if not rule:
+        return 0, "", "", True
+    if isinstance(rule, dict):
+        kind, flt = rule.get("type"), rule.get("filter")
+        if kind == "gamemode" and not flt:
+            return 2, "", "", True
+        if (kind == "process" and isinstance(flt, dict) and set(flt) <= {"name", "args"}
+                and flt.get("name")):
+            return 1, str(flt["name"]), str(flt.get("args") or ""), True
+    return 0, "", "", False
+
+
+def form_to_rule(kind, name, args):
+    """Formdan kural üretir (kural yoksa None); geçersizse ValueError."""
+    if kind == 1:
+        name, args = (name or "").strip(), (args or "").strip()
+        if not name:
+            raise ValueError("Süreç adı boş olamaz")
+        flt = {"name": name}
+        if args:
+            flt["args"] = args
+        return {"type": "process", "filter": flt}
+    if kind == 2:
+        return {"type": "gamemode"}
+    return None
 
 
 def parse_profiles(data):
@@ -206,17 +235,6 @@ def parse_profiles(data):
     current = data.get("current_profile")
     auto = bool(data.get("auto_switch", data.get("auto_switch_profiles", False)))
     return profiles, current, auto
-
-
-def parse_rule_text(text):
-    """Kural metni (JSON) -> nesne; boşsa None; geçersizse ValueError."""
-    text = (text or "").strip()
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except ValueError as exc:
-        raise ValueError(f"Kural geçerli JSON değil: {exc}") from exc
 
 
 def rule_summary(rule):

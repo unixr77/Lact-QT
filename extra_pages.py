@@ -1,14 +1,13 @@
 """Ek sekmeler: geçmiş, güç durumları, profiller, süreçler, sistem ve Vulkan penceresi."""
 import copy
-import json
 import time
 
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtGui import QColor, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QListWidget, QMessageBox, QPlainTextEdit, QPushButton,
+    QListWidget, QMessageBox, QPushButton,
     QSizePolicy, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -17,9 +16,9 @@ from profile_io import (
     build_export, config_to_changes, dumps, extract_profile, parse_export, pick_config, unique_name,
 )
 from logic import (
-    POWER_KINDS, RULE_TEMPLATES, HistoryStore, fmt_age, fmt_mem,
+    POWER_KINDS, RULE_KINDS, HistoryStore, fmt_age, fmt_mem, form_to_rule,
     heuristics_from_cells, history_to_csv, nice_range, parse_modes, parse_profiles,
-    parse_rule_text, parse_states, process_rows, rule_summary,
+    parse_states, process_rows, rule_summary, rule_to_form,
     sample_from_stats, states_to_config, temp_label, vbios_to_bytes,
 )
 from ui_common import DASH, confirm, waiting
@@ -383,24 +382,30 @@ class ProfilesPage(QWidget):
         self.auto_check.toggled.connect(self.toggle_auto)
         outer.addWidget(self.auto_check)
 
-        rule_box = QGroupBox("Etkinleştirme kuralı (JSON)")
+        self._rule_editable = False  # form düzenlenebilir mi (yalnızca basit kurallar)
+        self._rule_testable = False
+        self._rule_stored = None
+        rule_box = QGroupBox("Otomatik etkinleştirme kuralı")
         rule_lay = QVBoxLayout(rule_box)
-        self.rule_edit = QPlainTextEdit()
-        self.rule_edit.setMaximumHeight(120)
-        rule_lay.addWidget(self.rule_edit)
-        tmpl = QHBoxLayout()
-        for name in RULE_TEMPLATES:
-            btn = QPushButton(f"Şablon: {name}")
-            btn.clicked.connect(lambda _checked=False, n=name: self.fill_template(n))
-            tmpl.addWidget(btn)
-        tmpl.addStretch(1)
+        self.rule_hint = QLabel("")
+        rule_lay.addWidget(self.rule_hint)
+        rule_form = QFormLayout()
+        self.rule_kind = QComboBox()
+        self.rule_kind.addItems(RULE_KINDS)
+        self.rule_kind.currentIndexChanged.connect(self._sync_rule_form)
+        self.rule_name = QLineEdit()
+        self.rule_name.setPlaceholderText("ör. cs2 (çalışan sürecin adı)")
+        self.rule_args = QLineEdit()
+        self.rule_args.setPlaceholderText("isteğe bağlı: komut satırı argümanları")
+        rule_form.addRow("Ne zaman:", self.rule_kind)
+        rule_form.addRow("Süreç adı:", self.rule_name)
+        rule_form.addRow("Argümanlar:", self.rule_args)
+        rule_lay.addLayout(rule_form)
         self.test_btn = QPushButton("Kuralı dene")
         self.save_btn = QPushButton("Kuralı kaydet")
         self.test_btn.clicked.connect(self.test_rule)
         self.save_btn.clicked.connect(self.save_rule)
-        tmpl.addWidget(self.test_btn)
-        tmpl.addWidget(self.save_btn)
-        rule_lay.addLayout(tmpl)
+        rule_lay.addLayout(button_row(self.test_btn, self.save_btn))
         self.rule_result = QLabel("")
         rule_lay.addWidget(self.rule_result)
         outer.addWidget(rule_box)
@@ -448,12 +453,37 @@ class ProfilesPage(QWidget):
 
     def _row_changed(self, row):
         name = self._names[row] if 0 <= row < len(self._names) else None
-        rule = dict(self.profiles).get(name) if name is not None else None
-        self.rule_edit.setPlainText(json.dumps(rule, indent=2, ensure_ascii=False) if rule else "")
-        for widget in (self.rule_edit, self.save_btn, self.test_btn, self.delete_btn,
-                       self.up_btn, self.down_btn, self.hold_btn):
+        for widget in (self.delete_btn, self.up_btn, self.down_btn, self.hold_btn):
             widget.setEnabled(name is not None)
+        rule = dict(self.profiles).get(name) if name is not None else None
+        kind, pname, pargs, simple = rule_to_form(rule)
+        self._rule_stored = rule
+        self._rule_editable = name is not None and simple
+        self._rule_testable = name is not None
+        self.rule_kind.setCurrentIndex(kind)
+        self.rule_name.setText(pname)
+        self.rule_args.setText(pargs)
+        if name is None:
+            hint = ("Varsayılan profilin kuralı olmaz: hiçbir kural eşleşmediğinde bu profil kullanılır.\n"
+                    "Kural eklemek için 'Yeni profil…' ile bir profil oluşturup seç.")
+        elif not simple:
+            hint = (f"Bu profilin kuralı karmaşık ({rule_summary(rule)}); form yalnızca basit kuralları "
+                    "düzenler.\nKural olduğu gibi korunur; 'Kuralı dene' ile sınayabilirsin.")
+        else:
+            hint = ("'Kurallara göre otomatik profil değiştir' açıkken, kural eşleşince bu profil "
+                    "kendiliğinden etkinleşir.")
+        self.rule_hint.setText(hint)
+        self._sync_rule_form()
         self.rule_result.setText("")
+
+    def _sync_rule_form(self, *_args):
+        editable = self._rule_editable
+        process = self.rule_kind.currentIndex() == 1
+        self.rule_kind.setEnabled(editable)
+        self.rule_name.setEnabled(editable and process)
+        self.rule_args.setEnabled(editable and process)
+        self.save_btn.setEnabled(editable)
+        self.test_btn.setEnabled(self._rule_testable)
 
     # -- eylemler --
     def activate(self):
@@ -611,20 +641,23 @@ class ProfilesPage(QWidget):
         except LactError:
             return {}
 
-    def fill_template(self, name):
-        self.rule_edit.setPlainText(json.dumps(RULE_TEMPLATES[name], indent=2, ensure_ascii=False))
-
     def _rule(self):
+        """Geçerli kural: basit kuralda formdan, karmaşıkta saklı olandan. -> (geçerli, kural)"""
+        if not self._rule_editable:
+            return True, self._rule_stored
         try:
-            return True, parse_rule_text(self.rule_edit.toPlainText())
+            return True, form_to_rule(self.rule_kind.currentIndex(),
+                                      self.rule_name.text(), self.rule_args.text())
         except ValueError as exc:
             QMessageBox.warning(self, "Geçersiz kural", str(exc))
             return False, None
 
     def save_rule(self):
         row = self.selected()
+        if row is None or self._names[row] is None or not self._rule_editable:
+            return
         valid, rule = self._rule()
-        if row is None or self._names[row] is None or not valid:
+        if not valid:
             return
         ok, _ = self._run(self.client.set_profile_rule, self._names[row], rule)
         if ok:
@@ -632,7 +665,10 @@ class ProfilesPage(QWidget):
 
     def test_rule(self):
         valid, rule = self._rule()
-        if not valid or rule is None:
+        if not valid:
+            return
+        if rule is None:
+            self.rule_result.setText("Kural yok: bu profil yalnızca elle seçilir.")
             return
         ok, result = self._run(self.client.evaluate_profile_rule, rule)
         if ok:
